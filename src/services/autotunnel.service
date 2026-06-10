@@ -1,0 +1,19 @@
+[Unit]
+Description=Auto Tunnel VPN Panel Main Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/autotunnel
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/local/autotunnel/menu/main.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotunnel
+
+[Install]
+WantedBy=multi-user.target

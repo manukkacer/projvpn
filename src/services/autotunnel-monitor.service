@@ -1,0 +1,21 @@
+[Unit]
+Description=Auto Tunnel VPN Panel Monitoring Service
+After=network-online.target autotunnel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/autotunnel
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="VPS_MODE=%i"
+ExecStart=/bin/bash -c 'source /usr/local/autotunnel/functions/monitor.sh && start_monitoring_loop 60'
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotunnel-monitor
+ConditionPathExists=/usr/local/autotunnel/functions/monitor.sh
+
+[Install]
+WantedBy=multi-user.target

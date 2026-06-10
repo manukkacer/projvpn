@@ -1,0 +1,20 @@
+[Unit]
+Description=Auto Tunnel VPN Panel Telegram Bot Service
+After=network-online.target autotunnel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/autotunnel
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/bin/bash -c 'source /usr/local/autotunnel/functions/core.sh && source /usr/local/autotunnel/modules/telegram.sh && telegram_bot_start'
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotunnel-tgbot
+ConditionPathExists=/usr/local/autotunnel/config/telegram.conf
+
+[Install]
+WantedBy=multi-user.target
