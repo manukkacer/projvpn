@@ -1,63 +1,237 @@
 #!/bin/bash
 
 ################################################################################
-#  AUTO TUNNEL - CORE FUNCTIONS LIBRARY
-#  Central library for all shared functions
+# AUTO TUNNEL VPN PANEL - CORE LIBRARY
+# Foundation functions for all modules
+# Handles logging, caching, validation, and system utilities
 ################################################################################
 
-# Prevent multiple sourcing
-[[ -z "$CORE_FUNCTIONS_LOADED" ]] || return 0
-CORE_FUNCTIONS_LOADED=1
+set -o pipefail
 
-# Load configuration
-CONFIG_PATH="/usr/local/autotunnel/config"
-CACHE_PATH="/usr/local/autotunnel/cache"
-LOG_PATH="/usr/local/autotunnel/logs"
+# Colors for terminal output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly NC='\033[0m'
 
-# Load VPS configuration if exists
-[[ -f "$CONFIG_PATH/vps.conf" ]] && source "$CONFIG_PATH/vps.conf"
+# Paths
+readonly INSTALL_PATH="${INSTALL_PATH:-/usr/local/autotunnel}"
+readonly LOG_DIR="${LOG_DIR:-${INSTALL_PATH}/logs}"
+readonly CACHE_DIR="${CACHE_DIR:-${INSTALL_PATH}/cache}"
+readonly CONFIG_DIR="${CONFIG_DIR:-${INSTALL_PATH}/config}"
+readonly BACKUP_DIR="${BACKUP_DIR:-${INSTALL_PATH}/backup}"
+readonly DB_DIR="${DB_DIR:-${INSTALL_PATH}/data}"
+
+# Ensure directories exist
+mkdir -p "$LOG_DIR" "$CACHE_DIR" "$CONFIG_DIR" "$BACKUP_DIR" "$DB_DIR" 2>/dev/null || true
+
+# Load VPS configuration
+if [[ -f "${CONFIG_DIR}/vps.conf" ]]; then
+    source "${CONFIG_DIR}/vps.conf"
+else
+    VPS_MODE="HIGH_SPEC"
+    LOG_LEVEL="info"
+fi
 
 ################################################################################
 # LOGGING FUNCTIONS
 ################################################################################
 
-log_info() {
-    local msg="$1"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    [[ "$LOG_LEVEL" != "error" ]] && echo "[$timestamp] INFO: $msg" >> "$LOG_PATH/system.log"
+# Initialize log file
+init_log() {
+    local log_file="${1:-${LOG_DIR}/system.log}"
+    touch "$log_file" 2>/dev/null || true
+    chmod 644 "$log_file" 2>/dev/null || true
 }
 
+# Write to log file
+log_write() {
+    local level="$1"
+    local message="$2"
+    local log_file="${3:-${LOG_DIR}/system.log}"
+    local timestamp
+    
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # Skip debug logs in LOW_SPEC mode
+    if [[ "$VPS_MODE" == "LOW_SPEC" ]] && [[ "$level" == "DEBUG" ]]; then
+        return 0
+    fi
+    
+    # Check if message should be logged based on level
+    case "$LOG_LEVEL" in
+        error)
+            [[ "$level" != "ERROR" ]] && return 0
+            ;;
+        warn)
+            [[ ! "$level" =~ ^(ERROR|WARN)$ ]] && return 0
+            ;;
+        info)
+            [[ "$level" == "DEBUG" ]] && return 0
+            ;;
+    esac
+    
+    echo "[$timestamp] [$level] $message" >> "$log_file" 2>/dev/null || true
+}
+
+# Log error
 log_error() {
-    local msg="$1"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] ERROR: $msg" >> "$LOG_PATH/error.log"
+    local message="$1"
+    local log_file="${2:-${LOG_DIR}/error.log}"
+    log_write "ERROR" "$message" "$log_file"
+    echo -e "${RED}[✗] ERROR: $message${NC}" >&2
 }
 
+# Log warning
+log_warn() {
+    local message="$1"
+    local log_file="${2:-${LOG_DIR}/system.log}"
+    log_write "WARN" "$message" "$log_file"
+    echo -e "${YELLOW}[!] WARN: $message${NC}" >&2
+}
+
+# Log info
+log_info() {
+    local message="$1"
+    local log_file="${2:-${LOG_DIR}/system.log}"
+    log_write "INFO" "$message" "$log_file"
+    echo -e "${BLUE}[i] $message${NC}"
+}
+
+# Log success
+log_success() {
+    local message="$1"
+    local log_file="${2:-${LOG_DIR}/system.log}"
+    log_write "INFO" "$message" "$log_file"
+    echo -e "${GREEN}[✓] $message${NC}"
+}
+
+# Log debug
 log_debug() {
-    local msg="$1"
-    [[ "$LOG_LEVEL" == "debug" ]] || return 0
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] DEBUG: $msg" >> "$LOG_PATH/system.log"
+    local message="$1"
+    local log_file="${2:-${LOG_DIR}/system.log}"
+    log_write "DEBUG" "$message" "$log_file"
+    [[ "$LOG_LEVEL" == "debug" ]] && echo -e "${CYAN}[D] $message${NC}"
+}
+
+################################################################################
+# VALIDATION FUNCTIONS
+################################################################################
+
+# Validate domain name
+validate_domain() {
+    local domain="$1"
+    
+    if [[ -z "$domain" ]]; then
+        log_error "Domain cannot be empty"
+        return 1
+    fi
+    
+    if [[ ! "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+        log_error "Invalid domain format: $domain"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Validate IP address
+validate_ip() {
+    local ip="$1"
+    
+    if [[ -z "$ip" ]]; then
+        log_error "IP cannot be empty"
+        return 1
+    fi
+    
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        log_error "Invalid IP format: $ip"
+        return 1
+    fi
+    
+    local IFS='.'
+    local -a octets=($ip)
+    for octet in "${octets[@]}"; do
+        if (( octet > 255 )); then
+            log_error "Invalid IP address: $ip"
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+# Validate port number
+validate_port() {
+    local port="$1"
+    
+    if [[ -z "$port" ]] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        log_error "Port must be a number"
+        return 1
+    fi
+    
+    if (( port < 1 || port > 65535 )); then
+        log_error "Port must be between 1 and 65535"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Validate username
+validate_username() {
+    local username="$1"
+    
+    if [[ -z "$username" ]]; then
+        log_error "Username cannot be empty"
+        return 1
+    fi
+    
+    if [[ ! "$username" =~ ^[a-zA-Z0-9_-]{3,32}$ ]]; then
+        log_error "Username must be 3-32 alphanumeric characters"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Sanitize input
+sanitize_input() {
+    local input="$1"
+    # Remove potentially dangerous characters
+    echo "$input" | sed "s/[^a-zA-Z0-9._-]//g"
 }
 
 ################################################################################
 # CACHE FUNCTIONS
 ################################################################################
 
-cache_get() {
-    local key="$1"
-    local cache_file="$CACHE_PATH/${key}.cache"
+# Get cache file path
+get_cache_file() {
+    local cache_name="$1"
+    echo "${CACHE_DIR}/${cache_name}.cache"
+}
+
+# Read from cache
+read_cache() {
+    local cache_name="$1"
+    local max_age="${2:-600}"  # Default 10 minutes
+    local cache_file
+    
+    cache_file=$(get_cache_file "$cache_name")
     
     if [[ ! -f "$cache_file" ]]; then
         return 1
     fi
     
-    # Check cache expiration
-    local age=$(($(date +%s) - $(stat -c%Y "$cache_file" 2>/dev/null || echo 0)))
-    local max_age=$((${CACHE_REFRESH:-30} * 60))
+    # Check cache age
+    local file_age
+    file_age=$(($(date +%s) - $(stat -f%m "$cache_file" 2>/dev/null || stat -c%Y "$cache_file" 2>/dev/null)))
     
-    if (( age > max_age )); then
-        rm -f "$cache_file"
+    if (( file_age > max_age )); then
+        rm -f "$cache_file" 2>/dev/null || true
         return 1
     fi
     
@@ -65,296 +239,323 @@ cache_get() {
     return 0
 }
 
-cache_set() {
-    local key="$1"
-    local value="$2"
-    local cache_file="$CACHE_PATH/${key}.cache"
+# Write to cache
+write_cache() {
+    local cache_name="$1"
+    local data="$2"
+    local cache_file
     
-    echo "$value" > "$cache_file"
-    chmod 644 "$cache_file"
+    cache_file=$(get_cache_file "$cache_name")
+    echo "$data" > "$cache_file" 2>/dev/null || true
 }
 
-cache_clear() {
-    local key="$1"
-    local cache_file="$CACHE_PATH/${key}.cache"
-    [[ -f "$cache_file" ]] && rm -f "$cache_file"
-}
-
-cache_clear_all() {
-    rm -f "$CACHE_PATH"/*.cache
+# Clear cache
+clear_cache() {
+    local pattern="${1:-*}"
+    rm -f "${CACHE_DIR}/${pattern}.cache" 2>/dev/null || true
 }
 
 ################################################################################
 # SYSTEM INFORMATION FUNCTIONS
 ################################################################################
 
-get_vps_ip() {
-    # Try cache first
-    cache_get "vps_ip" && return 0
-    
-    local ip=$(curl -s --max-time 3 -4 https://ipinfo.io/ip 2>/dev/null || \
-               curl -s --max-time 3 -4 https://api.ipify.org 2>/dev/null || \
-               hostname -I | awk '{print $1}')
-    
-    [[ -n "$ip" ]] && cache_set "vps_ip" "$ip"
-    echo "$ip"
+# Get CPU usage percentage
+get_cpu_usage() {
+    if [[ -f /proc/stat ]]; then
+        local cpu_info
+        cpu_info=$(grep '^cpu ' /proc/stat | awk '{print ($2+$4)*100/($2+$4+$5) "%"}')
+        echo "$cpu_info"
+    else
+        echo "N/A"
+    fi
 }
 
-get_vps_domain() {
-    # Try cache first
-    cache_get "vps_domain" && return 0
+# Get RAM usage
+get_ram_info() {
+    local total_kb
+    local used_kb
+    local percent
     
-    # Read from config if set
-    if [[ -f "$CONFIG_PATH/system.conf" ]]; then
-        source "$CONFIG_PATH/system.conf"
-        [[ -n "$VPS_DOMAIN" ]] && cache_set "vps_domain" "$VPS_DOMAIN" && echo "$VPS_DOMAIN" && return 0
+    if command -v free &>/dev/null; then
+        local mem_info
+        mem_info=$(free -k | grep Mem:)
+        total_kb=$(echo "$mem_info" | awk '{print $2}')
+        used_kb=$(echo "$mem_info" | awk '{print $3}')
+        percent=$(echo "scale=1; ($used_kb * 100) / $total_kb" | bc)
+        echo "${used_kb}KB/${total_kb}KB (${percent}%)"
+    else
+        echo "N/A"
+    fi
+}
+
+# Get disk usage
+get_disk_usage() {
+    local path="${1:-/}"
+    if command -v df &>/dev/null; then
+        df -h "$path" | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}'
+    else
+        echo "N/A"
+    fi
+}
+
+# Get system uptime
+get_uptime() {
+    if [[ -f /proc/uptime ]]; then
+        local uptime_sec
+        uptime_sec=$(awk '{print int($1)}' /proc/uptime)
+        local days=$((uptime_sec / 86400))
+        local hours=$(((uptime_sec % 86400) / 3600))
+        local minutes=$(((uptime_sec % 3600) / 60))
+        echo "${days}d ${hours}h ${minutes}m"
+    else
+        echo "N/A"
+    fi
+}
+
+# Get server hostname
+get_hostname() {
+    hostname 2>/dev/null || echo "unknown"
+}
+
+# Get server IP
+get_server_ip() {
+    # Try to get public IP from cache first
+    if read_cache "server_ip" 3600 2>/dev/null; then
+        return 0
     fi
     
-    # Try reverse DNS lookup
-    local domain=$(dig -x $(get_vps_ip) +short 2>/dev/null | sed 's/\.$//' | head -1)
-    [[ -n "$domain" ]] && cache_set "vps_domain" "$domain" && echo "$domain"
-}
-
-get_vps_hostname() {
-    hostname -f 2>/dev/null || hostname
-}
-
-get_isp_info() {
-    # Try cache first
-    cache_get "isp_info" && return 0
+    # Get public IP with timeout
+    local ip
+    ip=$(curl -s --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
     
-    local ip=$(get_vps_ip)
-    local isp=$(curl -s --max-time 3 "https://ipinfo.io/$ip/org" 2>/dev/null | grep -o '[^ ]*$' || echo "Unknown")
-    
-    cache_set "isp_info" "$isp"
-    echo "$isp"
-}
-
-get_location_info() {
-    # Try cache first
-    cache_get "location_info" && return 0
-    
-    local ip=$(get_vps_ip)
-    local location=$(curl -s --max-time 3 "https://ipinfo.io/$ip/city,country" 2>/dev/null || echo "Unknown")
-    
-    cache_set "location_info" "$location"
-    echo "$location"
-}
-
-get_cpu_info() {
-    # Try cache first
-    cache_get "cpu_info" && return 0
-    
-    local cores=$(nproc 2>/dev/null || echo "1")
-    local usage=$(top -bn1 2>/dev/null | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}' || echo "0")
-    local info="${cores} cores, ${usage}% used"
-    
-    cache_set "cpu_info" "$info"
-    echo "$info"
-}
-
-get_ram_info() {
-    # Try cache first
-    cache_get "ram_info" && return 0
-    
-    local total=$(free -m | awk 'NR==2 {print $2}')
-    local used=$(free -m | awk 'NR==2 {print $3}')
-    local info="${used}MB/${total}MB"
-    
-    cache_set "ram_info" "$info"
-    echo "$info"
-}
-
-get_uptime() {
-    uptime -p 2>/dev/null || uptime | awk -F'up' '{print $2}' | sed 's/,.*//' | xargs
-}
-
-get_disk_info() {
-    local usage=$(df -h / | awk 'NR==2 {print $3"/"$2}')
-    echo "$usage"
+    if [[ -n "$ip" ]]; then
+        write_cache "server_ip" "$ip"
+        echo "$ip"
+    else
+        # Fallback to local IP
+        hostname -I | awk '{print $1}'
+    fi
 }
 
 ################################################################################
 # SERVICE MANAGEMENT FUNCTIONS
 ################################################################################
 
-service_start() {
+# Check if service is running
+is_service_running() {
     local service="$1"
-    systemctl start "$service" 2>/dev/null && log_info "Service started: $service" || log_error "Failed to start service: $service"
-}
-
-service_stop() {
-    local service="$1"
-    systemctl stop "$service" 2>/dev/null && log_info "Service stopped: $service" || log_error "Failed to stop service: $service"
-}
-
-service_restart() {
-    local service="$1"
-    systemctl restart "$service" 2>/dev/null && log_info "Service restarted: $service" || log_error "Failed to restart service: $service"
-}
-
-service_enable() {
-    local service="$1"
-    systemctl enable "$service" 2>/dev/null && log_info "Service enabled: $service" || log_error "Failed to enable service: $service"
-}
-
-service_status() {
-    local service="$1"
-    systemctl is-active "$service" 2>/dev/null && echo "active" || echo "inactive"
-}
-
-service_is_running() {
-    local service="$1"
-    systemctl is-active "$service" >/dev/null 2>&1
-}
-
-################################################################################
-# FILE & TEXT FUNCTIONS
-################################################################################
-
-sanitize_input() {
-    local input="$1"
-    # Remove dangerous characters
-    echo "$input" | sed 's/[^a-zA-Z0-9._-]//g'
-}
-
-validate_ip() {
-    local ip="$1"
-    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    
+    if systemctl is-active --quiet "$service"; then
         return 0
+    else
+        return 1
     fi
+}
+
+# Start service
+start_service() {
+    local service="$1"
+    
+    if systemctl start "$service"; then
+        log_success "Service $service started"
+        return 0
+    else
+        log_error "Failed to start service $service"
+        return 1
+    fi
+}
+
+# Stop service
+stop_service() {
+    local service="$1"
+    
+    if systemctl stop "$service"; then
+        log_success "Service $service stopped"
+        return 0
+    else
+        log_error "Failed to stop service $service"
+        return 1
+    fi
+}
+
+# Restart service
+restart_service() {
+    local service="$1"
+    
+    if systemctl restart "$service"; then
+        log_success "Service $service restarted"
+        return 0
+    else
+        log_error "Failed to restart service $service"
+        return 1
+    fi
+}
+
+# Enable service
+enable_service() {
+    local service="$1"
+    
+    if systemctl enable "$service"; then
+        log_success "Service $service enabled"
+        return 0
+    else
+        log_error "Failed to enable service $service"
+        return 1
+    fi
+}
+
+# Get service status
+get_service_status() {
+    local service="$1"
+    
+    if is_service_running "$service"; then
+        echo "running"
+    else
+        echo "stopped"
+    fi
+}
+
+################################################################################
+# ERROR HANDLING FUNCTIONS
+################################################################################
+
+# Check command success
+check_cmd() {
+    if [[ $? -eq 0 ]]; then
+        log_success "$1"
+        return 0
+    else
+        log_error "$1 failed"
+        return 1
+    fi
+}
+
+# Exit with error
+exit_error() {
+    local message="$1"
+    local code="${2:-1}"
+    log_error "$message"
+    exit "$code"
+}
+
+# Trap errors
+trap_error() {
+    local line_num=$1
+    local error_msg="Unexpected error at line $line_num"
+    log_error "$error_msg"
     return 1
 }
 
-validate_domain() {
-    local domain="$1"
-    if [[ $domain =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-        return 0
+################################################################################
+# FILE OPERATIONS
+################################################################################
+
+# Safe file backup
+backup_file() {
+    local file="$1"
+    local backup_path="${2:-${BACKUP_DIR}}"
+    
+    if [[ ! -f "$file" ]]; then
+        log_error "File not found: $file"
+        return 1
     fi
-    return 1
-}
-
-validate_port() {
-    local port="$1"
-    if [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
+    
+    mkdir -p "$backup_path"
+    local backup_file="${backup_path}/$(basename "$file").bak.$(date +%s)"
+    
+    if cp -p "$file" "$backup_file"; then
+        log_success "File backed up: $backup_file"
         return 0
+    else
+        log_error "Failed to backup file: $file"
+        return 1
     fi
-    return 1
 }
 
-################################################################################
-# USER MANAGEMENT FUNCTIONS
-################################################################################
-
-get_online_users() {
-    local protocol="$1"
-    # Placeholder - will be implemented per-protocol
-    echo "0"
-}
-
-get_total_users() {
-    local protocol="$1"
-    # Placeholder - will be implemented per-protocol
-    echo "0"
-}
-
-user_exists() {
-    local username="$1"
-    [[ -f "/usr/local/autotunnel/cache/users/${username}.user" ]] && return 0 || return 1
-}
-
-################################################################################
-# PROCESS & PERFORMANCE FUNCTIONS
-################################################################################
-
-get_process_count() {
-    ps aux | wc -l
-}
-
-get_memory_usage_percent() {
-    free | grep Mem | awk '{printf("%.0f", $3/$2 * 100.0)}'
-}
-
-get_cpu_usage_percent() {
-    top -bn1 2>/dev/null | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{printf "%.0f", 100 - $1}' || echo "0"
-}
-
-################################################################################
-# NETWORK FUNCTIONS
-################################################################################
-
-check_port_open() {
-    local port="$1"
-    timeout 2 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null && return 0 || return 1
-}
-
-get_open_ports() {
-    ss -tlnp 2>/dev/null | grep LISTEN | awk '{print $4}' | cut -d: -f2- || echo "N/A"
+# Safe file write
+write_file() {
+    local file="$1"
+    local content="$2"
+    local mode="${3:-644}"
+    
+    local dir
+    dir=$(dirname "$file")
+    
+    mkdir -p "$dir" 2>/dev/null || true
+    
+    if echo "$content" > "$file"; then
+        chmod "$mode" "$file" 2>/dev/null || true
+        return 0
+    else
+        log_error "Failed to write file: $file"
+        return 1
+    fi
 }
 
 ################################################################################
 # UTILITY FUNCTIONS
 ################################################################################
 
-random_string() {
-    local length=${1:-16}
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
+        return 1
+    fi
+    return 0
+}
+
+# Generate random string
+generate_random_string() {
+    local length="${1:-32}"
     tr -dc 'a-zA-Z0-9' </dev/urandom | head -c "$length"
 }
 
-random_port() {
-    local min=${1:-10000}
-    local max=${2:-60000}
-    echo $((RANDOM % (max - min + 1) + min))
+# Generate UUID
+generate_uuid() {
+    python3 -c 'import uuid; print(str(uuid.uuid4()))' 2>/dev/null || \
+    cat /proc/sys/kernel/random/uuid 2>/dev/null || \
+    tr -dc 'a-f0-9' </dev/urandom | head -c 32 | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/'
 }
 
-get_timestamp() {
-    date '+%Y-%m-%d %H:%M:%S'
+# Wait for condition
+wait_for() {
+    local condition="$1"
+    local timeout="${2:-30}"
+    local start
+    
+    start=$(date +%s)
+    while true; do
+        if eval "$condition"; then
+            return 0
+        fi
+        
+        if (( $(date +%s) - start > timeout )); then
+            return 1
+        fi
+        
+        sleep 1
+    done
 }
 
-sleep_optimized() {
-    # Use sleep with minimal overhead, respects LOW_SPEC mode
-    local seconds="$1"
-    if [[ "$VPS_MODE" == "LOW_SPEC" ]]; then
-        # Shorter sleep cycles in low-spec mode
-        sleep "${seconds}s"
-    else
-        sleep "${seconds}s"
-    fi
+# Convert bytes to human readable format
+format_bytes() {
+    local bytes="$1"
+    local units=(B KB MB GB TB)
+    local size=$bytes
+    local unit_idx=0
+    
+    while (( size > 1024 && unit_idx < ${#units[@]} - 1 )); do
+        size=$((size / 1024))
+        ((unit_idx++))
+    done
+    
+    echo "${size}${units[$unit_idx]}"
 }
 
-################################################################################
-# ERROR HANDLING
-################################################################################
-
-error_exit() {
-    local msg="$1"
-    local code=${2:-1}
-    log_error "$msg"
-    echo "[ERROR] $msg" >&2
-    exit "$code"
+# Check if command exists
+cmd_exists() {
+    command -v "$1" >/dev/null 2>&1
 }
 
-warn() {
-    local msg="$1"
-    echo "[WARN] $msg" >&2
-    log_info "WARNING: $msg"
-}
-
-info() {
-    local msg="$1"
-    echo "[INFO] $msg"
-    log_info "$msg"
-}
-
-export -f log_info log_error log_debug
-export -f cache_get cache_set cache_clear cache_clear_all
-export -f get_vps_ip get_vps_domain get_vps_hostname
-export -f get_isp_info get_location_info
-export -f get_cpu_info get_ram_info get_uptime get_disk_info
-export -f service_start service_stop service_restart service_enable service_status service_is_running
-export -f sanitize_input validate_ip validate_domain validate_port
-export -f get_online_users get_total_users user_exists
-export -f get_process_count get_memory_usage_percent get_cpu_usage_percent
-export -f check_port_open get_open_ports
-export -f random_string random_port get_timestamp sleep_optimized
-export -f error_exit warn info
+return 0 2>/dev/null || true

@@ -1,264 +1,461 @@
 #!/bin/bash
 
 ################################################################################
-#  USER MANAGEMENT FUNCTIONS
-#  Account creation, deletion, renewal, and monitoring
+# AUTO TUNNEL VPN PANEL - USER MANAGEMENT LIBRARY
+# Handles account creation, deletion, renewal, and user operations
 ################################################################################
 
-[[ -z "$USER_FUNCTIONS_LOADED" ]] || return 0
-USER_FUNCTIONS_LOADED=1
+set -o pipefail
 
-USER_DB_PATH="/usr/local/autotunnel/data/users"
-ACCOUNT_CACHE_PATH="/usr/local/autotunnel/cache/accounts"
-
-source /usr/local/autotunnel/functions/core.sh
-source /usr/local/autotunnel/functions/xray.sh
-
-mkdir -p "$USER_DB_PATH" "$ACCOUNT_CACHE_PATH"
+# Source core library
+source "${BASH_SOURCE%/*}/core.sh" || exit 1
 
 ################################################################################
-# ACCOUNT CREATION
+# USER DATABASE FUNCTIONS
 ################################################################################
 
-create_account() {
-    local username="$1"
-    local protocol="$2"
-    local days=${3:-30}
-    
-    # Validate input
-    username=$(sanitize_input "$username")
-    [[ -z "$username" ]] && error_exit "Invalid username"
-    
-    # Check if account exists
-    if user_exists "$username"; then
-        error_exit "Account already exists: $username"
-    fi
-    
-    local user_file="$USER_DB_PATH/${username}.user"
-    local expiry=$(date -d "+$days days" '+%Y-%m-%d %H:%M:%S')
-    local created=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    # Create account based on protocol
-    case "$protocol" in
-        vmess)
-            local credential=$(xray_add_vmess "$username" "$username@autotunnel")
-            ;;
-        vless)
-            local credential=$(xray_add_vless "$username" "$username@autotunnel")
-            ;;
-        trojan)
-            local credential=$(xray_add_trojan "$username" "$(random_string 16)")
-            ;;
-        shadowsocks)
-            local credential=$(xray_add_shadowsocks "$username" "$(random_string 16)")
-            ;;
-        *)
-            error_exit "Unknown protocol: $protocol"
-            ;;
-    esac
-    
-    # Save user record
-    cat > "$user_file" <<EOF
-USERNAME=$username
-PROTOCOL=$protocol
-CREATED=$created
-EXPIRY=$expiry
-CREDENTIAL=$credential
-STATUS=active
-BANDWIDTH=0
-EOF
-    
-    cache_set "user_${username}" "active"
-    log_info "Account created: $username ($protocol) - expires: $expiry"
-    
-    echo "Account created successfully"
-    echo "Username: $username"
-    echo "Protocol: $protocol"
-    echo "Expiry: $expiry"
-}
-
-################################################################################
-# ACCOUNT DELETION
-################################################################################
-
-delete_account() {
-    local username="$1"
-    
-    username=$(sanitize_input "$username")
-    [[ -z "$username" ]] && error_exit "Invalid username"
-    
-    local user_file="$USER_DB_PATH/${username}.user"
-    
-    if [[ ! -f "$user_file" ]]; then
-        error_exit "Account not found: $username"
-    fi
-    
-    # Get protocol from user file
-    local protocol=$(grep '^PROTOCOL=' "$user_file" | cut -d= -f2)
-    
-    # Delete from xray
-    xray_delete_account "$username" "$protocol"
-    
-    # Delete user record
-    rm -f "$user_file"
-    
-    # Clear cache
-    cache_clear "user_${username}"
-    
-    log_info "Account deleted: $username"
-    echo "Account deleted: $username"
-}
-
-################################################################################
-# ACCOUNT RENEWAL
-################################################################################
-
-renew_account() {
-    local username="$1"
-    local days=${2:-30}
-    
-    username=$(sanitize_input "$username")
-    [[ -z "$username" ]] && error_exit "Invalid username"
-    
-    local user_file="$USER_DB_PATH/${username}.user"
-    
-    if [[ ! -f "$user_file" ]]; then
-        error_exit "Account not found: $username"
-    fi
-    
-    local protocol=$(grep '^PROTOCOL=' "$user_file" | cut -d= -f2)
-    local expiry=$(date -d "+$days days" '+%Y-%m-%d %H:%M:%S')
-    
-    # Update expiry date
-    sed -i "s/^EXPIRY=.*/EXPIRY=$expiry/" "$user_file"
-    
-    xray_renew_account "$username" "$protocol" "$days"
-    cache_clear "user_${username}"
-    
-    log_info "Account renewed: $username - new expiry: $expiry"
-    echo "Account renewed: $username"
-    echo "New expiry: $expiry"
-}
-
-################################################################################
-# ACCOUNT INFORMATION
-################################################################################
-
-get_account_info() {
-    local username="$1"
-    
-    username=$(sanitize_input "$username")
-    [[ -z "$username" ]] && return 1
-    
-    local user_file="$USER_DB_PATH/${username}.user"
-    
-    if [[ ! -f "$user_file" ]]; then
-        return 1
-    fi
-    
-    cat "$user_file"
-}
-
-get_account_list() {
+# Get user database path
+get_user_db() {
     local protocol="$1"
-    
-    if [[ -z "$protocol" ]]; then
-        # All accounts
-        ls "$USER_DB_PATH"/*.user 2>/dev/null | wc -l
-    else
-        # Accounts for specific protocol
-        grep -l "^PROTOCOL=$protocol" "$USER_DB_PATH"/*.user 2>/dev/null | wc -l
-    fi
+    echo "${DB_DIR}/${protocol}_users.db"
 }
 
-################################################################################
-# ACCOUNT LIMITS
-################################################################################
-
-set_account_bandwidth_limit() {
-    local username="$1"
-    local limit_gb="$2"
+# Initialize user database
+init_user_db() {
+    local protocol="$1"
+    local db_path
     
-    username=$(sanitize_input "$username")
-    local user_file="$USER_DB_PATH/${username}.user"
-    
-    if [[ ! -f "$user_file" ]]; then
-        error_exit "Account not found: $username"
-    fi
-    
-    sed -i "s/^BANDWIDTH_LIMIT=.*/BANDWIDTH_LIMIT=$limit_gb/" "$user_file"
-    log_info "Bandwidth limit set for $username: ${limit_gb}GB"
+    db_path=$(get_user_db "$protocol")
+    mkdir -p "${DB_DIR}"
+    touch "$db_path"
+    chmod 600 "$db_path"
 }
 
-get_account_bandwidth_usage() {
-    local username="$1"
+# Add user to database
+add_user_db() {
+    local protocol="$1"
+    local username="$2"
+    local password="$3"
+    local expiry="$4"
+    local db_path
     
-    username=$(sanitize_input "$username")
-    local user_file="$USER_DB_PATH/${username}.user"
+    db_path=$(get_user_db "$protocol")
+    init_user_db "$protocol"
     
-    if [[ ! -f "$user_file" ]]; then
+    # Format: username:password:expiry:created:last_login
+    local created
+    created=$(date +%s)
+    
+    echo "${username}:${password}:${expiry}:${created}:0" >> "$db_path"
+    log_debug "User added to database: $protocol/$username"
+}
+
+# Remove user from database
+remove_user_db() {
+    local protocol="$1"
+    local username="$2"
+    local db_path
+    
+    db_path=$(get_user_db "$protocol")
+    
+    if [[ ! -f "$db_path" ]]; then
         return 1
     fi
     
-    grep '^BANDWIDTH=' "$user_file" | cut -d= -f2
+    grep -v "^${username}:" "$db_path" > "${db_path}.tmp" 2>/dev/null || true
+    mv "${db_path}.tmp" "$db_path"
+    log_debug "User removed from database: $protocol/$username"
 }
 
-################################################################################
-# TRIAL ACCOUNTS
-################################################################################
-
-create_trial_account() {
-    local username="trial_$(random_string 8)"
-    local protocol="${1:-vmess}"
-    local days=${2:-7}
+# Check if user exists
+user_exists() {
+    local protocol="$1"
+    local username="$2"
+    local db_path
     
-    create_account "$username" "$protocol" "$days"
-    echo "Trial account created: $username (expires in $days days)"
-}
-
-################################################################################
-# MONITORING
-################################################################################
-
-get_online_user_count() {
-    # Count active connections (placeholder - protocol-specific implementation)
-    ps aux | grep -E 'xray|vmess|vless|trojan' | grep -v grep | wc -l
-}
-
-get_expired_accounts() {
-    local current_time=$(date '+%Y-%m-%d %H:%M:%S')
-    local expired_count=0
+    db_path=$(get_user_db "$protocol")
     
-    while IFS= read -r user_file; do
-        local expiry=$(grep '^EXPIRY=' "$user_file" | cut -d= -f2)
-        if [[ "$current_time" > "$expiry" ]]; then
-            ((expired_count++))
+    if [[ ! -f "$db_path" ]]; then
+        return 1
+    fi
+    
+    grep -q "^${username}:" "$db_path" 2>/dev/null
+}
+
+# Get user expiry
+get_user_expiry() {
+    local protocol="$1"
+    local username="$2"
+    local db_path
+    
+    db_path=$(get_user_db "$protocol")
+    
+    if [[ ! -f "$db_path" ]]; then
+        return 1
+    fi
+    
+    grep "^${username}:" "$db_path" | cut -d':' -f3
+}
+
+# Update user expiry
+update_user_expiry() {
+    local protocol="$1"
+    local username="$2"
+    local new_expiry="$3"
+    local db_path
+    
+    db_path=$(get_user_db "$protocol")
+    
+    if [[ ! -f "$db_path" ]]; then
+        return 1
+    fi
+    
+    # Replace the expiry field
+    sed -i.bak "s/^\(${username}:[^:]*:\)[^:]*\(:[^:]*:[^:]*\)$/\1${new_expiry}\2/" "$db_path"
+    rm -f "${db_path}.bak"
+}
+
+################################################################################
+# ACCOUNT CREATION FUNCTIONS
+################################################################################
+
+# Create SSH account
+create_ssh_user() {
+    local username="$1"
+    local password="$2"
+    local days="${3:-30}"
+    
+    # Validate inputs
+    if ! validate_username "$username"; then
+        return 1
+    fi
+    
+    if [[ -z "$password" ]]; then
+        log_error "Password cannot be empty"
+        return 1
+    fi
+    
+    # Check if user exists
+    if id "$username" &>/dev/null; then
+        log_error "User already exists: $username"
+        return 1
+    fi
+    
+    # Calculate expiry
+    local expiry
+    expiry=$(($(date +%s) + (days * 86400)))
+    
+    # Create system user
+    useradd -m -s /bin/bash "$username" 2>/dev/null || {
+        log_error "Failed to create system user: $username"
+        return 1
+    }
+    
+    # Set password
+    echo "${username}:${password}" | chpasswd || {
+        log_error "Failed to set password for: $username"
+        userdel -r "$username" 2>/dev/null || true
+        return 1
+    }
+    
+    # Add to database
+    add_user_db "ssh" "$username" "$(echo -n "$password" | sha256sum | cut -d' ' -f1)" "$expiry"
+    
+    log_success "SSH user created: $username (expires: $(date -d @$expiry +'%Y-%m-%d'))"
+    return 0
+}
+
+# Create trial SSH account
+create_trial_ssh_user() {
+    local username="$1"
+    local days="${2:-7}"
+    local password
+    
+    password=$(generate_random_string 12)
+    create_ssh_user "$username" "$password" "$days"
+}
+
+# Create VMESS account
+create_vmess_user() {
+    local username="$1"
+    local days="${2:-30}"
+    local uuid
+    local expiry
+    
+    if ! validate_username "$username"; then
+        return 1
+    fi
+    
+    if user_exists "vmess" "$username"; then
+        log_error "VMESS user already exists: $username"
+        return 1
+    fi
+    
+    uuid=$(generate_uuid)
+    expiry=$(($(date +%s) + (days * 86400)))
+    
+    add_user_db "vmess" "$username" "$uuid" "$expiry"
+    
+    log_success "VMESS user created: $username (UUID: $uuid)"
+    echo "$uuid"
+    return 0
+}
+
+# Create VLESS account
+create_vless_user() {
+    local username="$1"
+    local days="${2:-30}"
+    local uuid
+    local expiry
+    
+    if ! validate_username "$username"; then
+        return 1
+    fi
+    
+    if user_exists "vless" "$username"; then
+        log_error "VLESS user already exists: $username"
+        return 1
+    fi
+    
+    uuid=$(generate_uuid)
+    expiry=$(($(date +%s) + (days * 86400)))
+    
+    add_user_db "vless" "$username" "$uuid" "$expiry"
+    
+    log_success "VLESS user created: $username (UUID: $uuid)"
+    echo "$uuid"
+    return 0
+}
+
+# Create Trojan account
+create_trojan_user() {
+    local username="$1"
+    local days="${2:-30}"
+    local password
+    local expiry
+    
+    if ! validate_username "$username"; then
+        return 1
+    fi
+    
+    if user_exists "trojan" "$username"; then
+        log_error "Trojan user already exists: $username"
+        return 1
+    fi
+    
+    password=$(generate_random_string 20)
+    expiry=$(($(date +%s) + (days * 86400)))
+    
+    add_user_db "trojan" "$username" "$password" "$expiry"
+    
+    log_success "Trojan user created: $username"
+    echo "$password"
+    return 0
+}
+
+# Create Shadowsocks account
+create_ss_user() {
+    local username="$1"
+    local days="${2:-30}"
+    local password
+    local expiry
+    
+    if ! validate_username "$username"; then
+        return 1
+    fi
+    
+    if user_exists "shadowsocks" "$username"; then
+        log_error "Shadowsocks user already exists: $username"
+        return 1
+    fi
+    
+    password=$(generate_random_string 16)
+    expiry=$(($(date +%s) + (days * 86400)))
+    
+    add_user_db "shadowsocks" "$username" "$password" "$expiry"
+    
+    log_success "Shadowsocks user created: $username"
+    echo "$password"
+    return 0
+}
+
+################################################################################
+# ACCOUNT DELETION FUNCTIONS
+################################################################################
+
+# Delete SSH account
+delete_ssh_user() {
+    local username="$1"
+    
+    if ! id "$username" &>/dev/null; then
+        log_error "User not found: $username"
+        return 1
+    fi
+    
+    # Kill user processes
+    pkill -9 -u "$username" 2>/dev/null || true
+    
+    # Remove system user
+    userdel -r "$username" 2>/dev/null || {
+        log_error "Failed to delete system user: $username"
+        return 1
+    }
+    
+    # Remove from database
+    remove_user_db "ssh" "$username"
+    
+    log_success "SSH user deleted: $username"
+    return 0
+}
+
+# Delete VMESS account
+delete_vmess_user() {
+    local username="$1"
+    
+    if ! user_exists "vmess" "$username"; then
+        log_error "VMESS user not found: $username"
+        return 1
+    fi
+    
+    remove_user_db "vmess" "$username"
+    log_success "VMESS user deleted: $username"
+    return 0
+}
+
+# Delete VLESS account
+delete_vless_user() {
+    local username="$1"
+    
+    if ! user_exists "vless" "$username"; then
+        log_error "VLESS user not found: $username"
+        return 1
+    fi
+    
+    remove_user_db "vless" "$username"
+    log_success "VLESS user deleted: $username"
+    return 0
+}
+
+# Delete Trojan account
+delete_trojan_user() {
+    local username="$1"
+    
+    if ! user_exists "trojan" "$username"; then
+        log_error "Trojan user not found: $username"
+        return 1
+    fi
+    
+    remove_user_db "trojan" "$username"
+    log_success "Trojan user deleted: $username"
+    return 0
+}
+
+# Delete Shadowsocks account
+delete_ss_user() {
+    local username="$1"
+    
+    if ! user_exists "shadowsocks" "$username"; then
+        log_error "Shadowsocks user not found: $username"
+        return 1
+    fi
+    
+    remove_user_db "shadowsocks" "$username"
+    log_success "Shadowsocks user deleted: $username"
+    return 0
+}
+
+################################################################################
+# ACCOUNT RENEWAL FUNCTIONS
+################################################################################
+
+# Renew user account
+renew_user() {
+    local protocol="$1"
+    local username="$2"
+    local days="${3:-30}"
+    
+    if ! user_exists "$protocol" "$username"; then
+        log_error "User not found: $protocol/$username"
+        return 1
+    fi
+    
+    local new_expiry
+    new_expiry=$(($(date +%s) + (days * 86400)))
+    
+    update_user_expiry "$protocol" "$username" "$new_expiry"
+    
+    log_success "User renewed: $protocol/$username (expires: $(date -d @$new_expiry +'%Y-%m-%d'))"
+    return 0
+}
+
+################################################################################
+# LIST FUNCTIONS
+################################################################################
+
+# List all users for a protocol
+list_users() {
+    local protocol="$1"
+    local db_path
+    
+    db_path=$(get_user_db "$protocol")
+    
+    if [[ ! -f "$db_path" ]]; then
+        log_info "No users found for $protocol"
+        return 0
+    fi
+    
+    echo -e "\n${BLUE}=== $protocol Users ===${NC}"
+    echo -e "${CYAN}Username${NC}\t${CYAN}Expires${NC}"
+    echo -e "${CYAN}--------${NC}\t${CYAN}-------${NC}"
+    
+    while IFS=: read -r username password expiry created last_login; do
+        local expires_date
+        expires_date=$(date -d @"$expiry" +'%Y-%m-%d' 2>/dev/null || echo "Invalid")
+        echo -e "$username\t$expires_date"
+    done < "$db_path"
+}
+
+################################################################################
+# COUNT FUNCTIONS
+################################################################################
+
+# Count users for a protocol
+count_users() {
+    local protocol="$1"
+    local db_path
+    
+    db_path=$(get_user_db "$protocol")
+    
+    if [[ ! -f "$db_path" ]]; then
+        echo 0
+    else
+        wc -l < "$db_path"
+    fi
+}
+
+# Count active users (not expired)
+count_active_users() {
+    local protocol="$1"
+    local db_path
+    local count=0
+    
+    db_path=$(get_user_db "$protocol")
+    
+    if [[ ! -f "$db_path" ]]; then
+        echo 0
+        return 0
+    fi
+    
+    local now
+    now=$(date +%s)
+    
+    while IFS=: read -r username password expiry created last_login; do
+        if (( expiry > now )); then
+            ((count++))
         fi
-    done < <(find "$USER_DB_PATH" -name "*.user" -type f)
+    done < "$db_path"
     
-    echo "$expired_count"
+    echo "$count"
 }
 
-delete_expired_accounts() {
-    local current_time=$(date '+%Y-%m-%d %H:%M:%S')
-    local deleted=0
-    
-    while IFS= read -r user_file; do
-        local username=$(grep '^USERNAME=' "$user_file" | cut -d= -f2)
-        local expiry=$(grep '^EXPIRY=' "$user_file" | cut -d= -f2)
-        
-        if [[ "$current_time" > "$expiry" ]]; then
-            delete_account "$username"
-            ((deleted++))
-        fi
-    done < <(find "$USER_DB_PATH" -name "*.user" -type f)
-    
-    log_info "Deleted $deleted expired accounts"
-    echo "Deleted $deleted expired accounts"
-}
-
-export -f create_account delete_account renew_account
-export -f get_account_info get_account_list
-export -f set_account_bandwidth_limit get_account_bandwidth_usage
-export -f create_trial_account
-export -f get_online_user_count get_expired_accounts delete_expired_accounts
+return 0 2>/dev/null || true
