@@ -1,0 +1,39 @@
+# Logs
+*.log
+logs/
+
+# Cache
+cache/*.db
+cache/*.tmp
+
+# Backup
+backup/*
+!backup/.gitkeep
+
+# Config (user-specific)
+config/system.conf
+config/service.conf
+config/telegram.conf
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# System
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Node modules (if using)
+node_modules/
+
+# OS
+Thumbs.db
+.DS_Store
