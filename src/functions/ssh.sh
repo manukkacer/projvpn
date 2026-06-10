@@ -1,164 +1,376 @@
 #!/bin/bash
 
 ################################################################################
-#  SSH MANAGEMENT FUNCTIONS
-#  SSH account and key management
+# AUTO TUNNEL VPN PANEL - SSH MANAGEMENT LIBRARY
+# Handles SSH user creation, deletion, renewal, and management
 ################################################################################
 
-[[ -z "$SSH_FUNCTIONS_LOADED" ]] || return 0
-SSH_FUNCTIONS_LOADED=1
+set -o pipefail
 
-SSH_DB_PATH="/usr/local/autotunnel/data/ssh"
+# Source core library
+source "${BASH_SOURCE%/*}/core.sh" || exit 1
+source "${BASH_SOURCE%/*}/user.sh" || exit 1
 
-source /usr/local/autotunnel/functions/core.sh
-
-mkdir -p "$SSH_DB_PATH"
+readonly SSH_PORT=22
+readonly SSHD_CONFIG="/etc/ssh/sshd_config"
 
 ################################################################################
-# SSH ACCOUNT CREATION
+# SSH SERVICE MANAGEMENT
 ################################################################################
 
-add_ssh_user() {
+# Check SSH service status
+ssh_is_running() {
+    is_service_running sshd
+}
+
+# Start SSH service
+start_ssh() {
+    start_service sshd
+}
+
+# Stop SSH service
+stop_ssh() {
+    stop_service sshd
+}
+
+# Restart SSH service
+restart_ssh() {
+    restart_service sshd
+}
+
+################################################################################
+# SSH CONFIGURATION
+################################################################################
+
+# Backup SSH config
+backup_ssh_config() {
+    backup_file "$SSHD_CONFIG"
+}
+
+# Get SSH config value
+get_ssh_config_value() {
+    local key="$1"
+    grep "^${key}" "$SSHD_CONFIG" | head -n1 | awk '{print $2}'
+}
+
+# Set SSH config value
+set_ssh_config_value() {
+    local key="$1"
+    local value="$2"
+    
+    if grep -q "^${key}" "$SSHD_CONFIG"; then
+        sed -i "s/^${key} .*/${key} ${value}/" "$SSHD_CONFIG"
+    else
+        echo "${key} ${value}" >> "$SSHD_CONFIG"
+    fi
+}
+
+################################################################################
+# SSH USER OPERATIONS
+################################################################################
+
+# Create SSH user with extended features
+create_ssh_user_full() {
     local username="$1"
     local password="$2"
-    local shell=${3:-/bin/bash}
+    local days="${3:-30}"
+    local shell="${4:-/bin/bash}"
+    local home="${5:-/home/$username}"
     
-    username=$(sanitize_input "$username")
-    [[ -z "$username" || -z "$password" ]] && error_exit "Invalid parameters"
+    # Validate inputs
+    if ! validate_username "$username"; then
+        return 1
+    fi
+    
+    if [[ -z "$password" ]]; then
+        log_error "Password cannot be empty"
+        return 1
+    fi
     
     # Check if user exists
     if id "$username" &>/dev/null; then
-        error_exit "User already exists: $username"
+        log_error "User already exists: $username"
+        return 1
     fi
+    
+    # Calculate expiry
+    local expiry
+    expiry=$(($(date +%s) + (days * 86400)))
     
     # Create system user
-    useradd -m -s "$shell" -d "/home/$username" "$username" 2>/dev/null || error_exit "Failed to create user"
+    useradd -m -d "$home" -s "$shell" "$username" || {
+        log_error "Failed to create system user: $username"
+        return 1
+    }
     
     # Set password
-    echo "$username:$password" | chpasswd
+    echo "${username}:${password}" | chpasswd || {
+        log_error "Failed to set password for: $username"
+        userdel -r "$username" 2>/dev/null || true
+        return 1
+    }
     
-    # Save to database
-    local ssh_file="$SSH_DB_PATH/${username}.ssh"
-    local created=$(date '+%Y-%m-%d %H:%M:%S')
+    # Set password expiry
+    chage -M "$days" "$username" 2>/dev/null || true
     
-    cat > "$ssh_file" <<EOF
-USERNAME=$username
-SHELL=$shell
-CREATED=$created
-STATUS=active
-EOF
+    # Set home directory permissions
+    chmod 700 "$home" 2>/dev/null || true
     
-    log_info "SSH user created: $username"
-    echo "SSH user created: $username"
+    # Add to database
+    add_user_db "ssh" "$username" "$(echo -n "$password" | sha256sum | cut -d' ' -f1)" "$expiry"
+    
+    log_success "SSH user created: $username (expires: $(date -d @$expiry +'%Y-%m-%d'))"
+    write_cache "ssh_user_${username}" "$username:$expiry" 300
+    
+    return 0
 }
 
-################################################################################
-# SSH ACCOUNT DELETION
-################################################################################
-
-delete_ssh_user() {
+# Delete SSH user completely
+delete_ssh_user_full() {
     local username="$1"
-    
-    username=$(sanitize_input "$username")
-    [[ -z "$username" ]] && error_exit "Invalid username"
+    local keep_home="${2:-false}"
     
     if ! id "$username" &>/dev/null; then
-        error_exit "User not found: $username"
+        log_error "User not found: $username"
+        return 1
     fi
     
-    # Remove user and home directory
-    userdel -rf "$username" 2>/dev/null || warn "Failed to delete user $username"
+    # Kill user processes
+    pkill -9 -u "$username" 2>/dev/null || true
+    sleep 1
+    
+    # Close SSH sessions
+    pkill -9 -f "sshd.*\[$username\]" 2>/dev/null || true
+    
+    # Remove system user
+    if [[ "$keep_home" == "true" ]]; then
+        userdel "$username" 2>/dev/null || {
+            log_error "Failed to delete system user: $username"
+            return 1
+        }
+    else
+        userdel -r "$username" 2>/dev/null || {
+            log_error "Failed to delete system user: $username"
+            return 1
+        }
+    fi
     
     # Remove from database
-    rm -f "$SSH_DB_PATH/${username}.ssh"
+    remove_user_db "ssh" "$username"
     
-    log_info "SSH user deleted: $username"
-    echo "SSH user deleted: $username"
+    # Clear cache
+    clear_cache "ssh_user_*"
+    
+    log_success "SSH user deleted: $username"
+    return 0
 }
 
-################################################################################
-# SSH USER MANAGEMENT
-################################################################################
-
+# Change SSH user password
 change_ssh_password() {
     local username="$1"
     local new_password="$2"
     
-    username=$(sanitize_input "$username")
-    [[ -z "$username" || -z "$new_password" ]] && error_exit "Invalid parameters"
-    
     if ! id "$username" &>/dev/null; then
-        error_exit "User not found: $username"
+        log_error "User not found: $username"
+        return 1
     fi
     
-    echo "$username:$new_password" | chpasswd || error_exit "Failed to change password"
-    log_info "SSH password changed for: $username"
+    if [[ -z "$new_password" ]]; then
+        log_error "Password cannot be empty"
+        return 1
+    fi
+    
+    # Set new password
+    echo "${username}:${new_password}" | chpasswd || {
+        log_error "Failed to change password for: $username"
+        return 1
+    }
+    
+    log_success "Password changed for: $username"
+    return 0
 }
 
-list_ssh_users() {
-    # List all SSH users from database
-    find "$SSH_DB_PATH" -name "*.ssh" -type f | wc -l
+# Renew SSH user expiry
+renew_ssh_user() {
+    local username="$1"
+    local days="${2:-30}"
+    
+    if ! id "$username" &>/dev/null; then
+        log_error "User not found: $username"
+        return 1
+    fi
+    
+    local new_expiry
+    new_expiry=$(($(date +%s) + (days * 86400)))
+    
+    # Update expiry in system
+    chage -M "$days" "$username" 2>/dev/null || true
+    
+    # Update in database
+    update_user_expiry "ssh" "$username" "$new_expiry"
+    
+    log_success "SSH user renewed: $username (expires: $(date -d @$new_expiry +'%Y-%m-%d'))"
+    return 0
 }
 
 ################################################################################
-# SSH KEY MANAGEMENT
+# SSH USER LOCKING/UNLOCKING
 ################################################################################
 
-generateSshKey() {
+# Lock SSH user account
+lock_ssh_user() {
     local username="$1"
-    local key_type=${2:-rsa}
-    local key_size=${3:-2048}
-    
-    username=$(sanitize_input "$username")
-    [[ -z "$username" ]] && error_exit "Invalid username"
     
     if ! id "$username" &>/dev/null; then
-        error_exit "User not found: $username"
+        log_error "User not found: $username"
+        return 1
     fi
     
-    local home_dir="/home/$username"
-    local ssh_dir="$home_dir/.ssh"
+    usermod -L "$username" || {
+        log_error "Failed to lock user: $username"
+        return 1
+    }
     
-    # Create .ssh directory
-    mkdir -p "$ssh_dir"
-    chmod 700 "$ssh_dir"
-    
-    # Generate key
-    ssh-keygen -t "$key_type" -b "$key_size" -f "$ssh_dir/id_${key_type}" -N "" -C "$username@autotunnel" <<< y >/dev/null 2>&1
-    
-    # Set permissions
-    chmod 600 "$ssh_dir/id_${key_type}"
-    chmod 644 "$ssh_dir/id_${key_type}.pub"
-    chown -R "$username:$username" "$ssh_dir"
-    
-    log_info "SSH key generated for: $username"
-    echo "SSH key generated successfully"
+    log_success "SSH user locked: $username"
+    return 0
 }
 
-add_ssh_public_key() {
+# Unlock SSH user account
+unlock_ssh_user() {
     local username="$1"
-    local public_key="$2"
-    
-    username=$(sanitize_input "$username")
-    [[ -z "$username" || -z "$public_key" ]] && error_exit "Invalid parameters"
     
     if ! id "$username" &>/dev/null; then
-        error_exit "User not found: $username"
+        log_error "User not found: $username"
+        return 1
     fi
     
-    local home_dir="/home/$username"
-    local ssh_dir="$home_dir/.ssh"
-    local auth_keys="$ssh_dir/authorized_keys"
+    usermod -U "$username" || {
+        log_error "Failed to unlock user: $username"
+        return 1
+    }
     
-    mkdir -p "$ssh_dir"
-    chmod 700 "$ssh_dir"
-    
-    echo "$public_key" >> "$auth_keys"
-    chmod 600 "$auth_keys"
-    chown -R "$username:$username" "$ssh_dir"
-    
-    log_info "SSH public key added for: $username"
+    log_success "SSH user unlocked: $username"
+    return 0
 }
 
-export -f add_ssh_user delete_ssh_user change_ssh_password list_ssh_users
-export -f generateSshKey add_ssh_public_key
+# Check if user is locked
+is_user_locked() {
+    local username="$1"
+    
+    if ! id "$username" &>/dev/null; then
+        return 1
+    fi
+    
+    passwd -S "$username" | grep -q "L"
+}
+
+################################################################################
+# SSH USER INFORMATION
+################################################################################
+
+# Get SSH user info
+get_ssh_user_info() {
+    local username="$1"
+    
+    if ! id "$username" &>/dev/null; then
+        log_error "User not found: $username"
+        return 1
+    fi
+    
+    echo "Username: $username"
+    id "$username"
+    
+    if user_exists "ssh" "$username"; then
+        local expiry
+        expiry=$(get_user_expiry "ssh" "$username")
+        echo "Expires: $(date -d @$expiry +'%Y-%m-%d %H:%M:%S')"
+    fi
+}
+
+# Check online SSH users
+check_online_ssh_users() {
+    local username="${1:-all}"
+    
+    echo -e "\n${BLUE}=== Online SSH Users ===${NC}"
+    
+    if [[ "$username" == "all" ]]; then
+        ps aux | grep "sshd:" | grep -v "^root" | awk '{print $1}' | sort -u
+    else
+        if ps aux | grep "sshd:.*\[$username\]" &>/dev/null; then
+            echo "$username is online"
+            return 0
+        else
+            echo "$username is offline"
+            return 1
+        fi
+    fi
+}
+
+# Count online SSH users
+count_online_ssh_users() {
+    ps aux | grep "sshd:" | grep -v "^root" | awk '{print $1}' | sort -u | wc -l
+}
+
+################################################################################
+# SSH LOGIN DETECTION
+################################################################################
+
+# Check last login
+get_last_login() {
+    local username="$1"
+    
+    if ! id "$username" &>/dev/null; then
+        log_error "User not found: $username"
+        return 1
+    fi
+    
+    lastlog -u "$username" 2>/dev/null | tail -n1
+}
+
+# Check failed login attempts
+get_failed_logins() {
+    local username="$1"
+    
+    if [[ -f /var/log/auth.log ]]; then
+        grep "Failed password for $username" /var/log/auth.log | wc -l
+    elif [[ -f /var/log/secure ]]; then
+        grep "Failed password for $username" /var/log/secure | wc -l
+    else
+        echo 0
+    fi
+}
+
+################################################################################
+# MULTI-LOGIN DETECTION
+################################################################################
+
+# Limit simultaneous logins per user
+set_login_limit() {
+    local username="$1"
+    local max_logins="${2:-1}"
+    
+    # Configure limits via limits.conf
+    echo "${username} maxlogins ${max_logins}" >> /etc/security/limits.conf 2>/dev/null || true
+    
+    log_success "Login limit set for $username: $max_logins"
+}
+
+# Get current login count
+get_current_login_count() {
+    local username="$1"
+    who | grep "^${username}" | wc -l
+}
+
+# Kill other SSH sessions for user
+kill_other_ssh_sessions() {
+    local username="$1"
+    local keep_pid="${2:-$$}"
+    
+    ps aux | grep "sshd:.*\[$username\]" | grep -v "$$" | awk '{print $2}' | while read -r pid; do
+        if [[ "$pid" != "$keep_pid" ]]; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+return 0 2>/dev/null || true
